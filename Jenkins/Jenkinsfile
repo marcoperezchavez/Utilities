@@ -1,0 +1,195 @@
+isDevelop = (env.BRANCH_NAME == "develop") ? true : false
+isDeployable = (env.BRANCH_NAME == "main" || env.BRANCH_NAME == "develop" || env.BRANCH_NAME.startsWith("release/")) ? true : false
+
+pipeline {
+    // Limit this to run on only some machines
+    agent { label "U19StaticSlave83" }
+
+	environment {
+        MAJOR 						= '1'
+        MINOR 						= '0'
+		PATCH						= '1'
+		// RELEASE_BUILD_NUMBER will be zero (0) for all branches except for release/* 
+		//  where it will be the final build number for that release.
+		//  Change this variable only in the release/* branch.
+		RELEASE_BUILD_NUMBER = '0'
+        CONTAINER_NAME          	= 'adiposservice' //name used to create containers/services/zips
+        DOCKERFILE_LOC          	= 'Source/ADIPOS/Microservice.Service/' //location of docker file
+        SONAR_SCAN_SOURCE       	= "Microservice.UnitTest" //Typically matches the SubDir where the Tests occur
+        SONAR_PROJ_NAME         	= "ADIPOS"          //Reported name to sonarQube server
+        SONAR_RUN_DIRECTORY     	= "Source/ADIPOS/" //SonarScanner must be run from a specific directory. If run at root, can leave as ''
+        SONAR_ANALYSIS_EXCLUSIONS	= "**/bin/**/*,**/obj/**/*,**/SwaggerExamples/**,**/*Test.cs,**/Program.cs"
+		SONAR_COVERAGE_EXCLUSIONS	= "**/Resources/**,**/*Contracts/**"
+        OP_VERSION_NOBUILD			= "$MAJOR.$MINOR.$PATCH"
+		ADI_TOOLS_VERSION       	= "v1.0.0"
+    }  
+ 
+	options {
+		//Discard after 5 builds.
+		buildDiscarder(logRotator(numToKeepStr: '5'))
+		
+		//Timeout after 60 minutes so that build does not hang.
+        timeout(time: 60, unit: 'MINUTES')
+		
+        // Add timestamps to the output.
+        timestamps()
+		
+		//No concurrent builds.
+		disableConcurrentBuilds()
+	}  
+  
+    stages {
+
+        stage ('Clean') {
+		    steps {
+				echo "Cleaning Workspace..."
+				sh """
+				  git reset --hard
+				  git clean -fdx
+				  """
+                script {
+                  if (isDevelop) {
+				    sh "docker image prune -f"
+                  }
+                }
+			}
+        }
+		stage ('Version') {
+			steps {
+				echo "Determining Version..."
+				script {
+				    def buildNumber = (env.BRANCH_NAME == "main") ? env.BUILD_NUMBER : (env.BRANCH_NAME.startsWith("release/") ? env.RELEASE_BUILD_NUMBER : 0)
+					env.VERSION_NUMBER = "${env.MAJOR}" + "." + "${env.MINOR}" + "." + "${env.PATCH}" + "." + "${buildNumber}"
+					echo "VERSION_NUMBER " + env.VERSION_NUMBER
+					sh "echo ${env.VERSION_NUMBER} > Deployment/version"
+					sh "echo ${env.VERSION_NUMBER} > Source/version"
+					env.OP_BRANCH_NAME = env.BRANCH_NAME
+					env.OP_VERSION = env.VERSION_NUMBER
+
+					if (env.BRANCH_NAME.startsWith('release/')) {
+                    //this is used to calculate the folder name for deployment purposes. i.e. release/ASDF then env.OP_VERSION = ASDF-$env.BUILD_NUMBER
+						String branchName = env.BRANCH_NAME.substring(env.BRANCH_NAME.lastIndexOf('/') + 1, env.BRANCH_NAME.length())
+						env.OP_BRANCH_NAME = "release"
+						env.OP_VERSION = branchName + "-" + buildNumber
+					}
+				}
+			}
+		}            
+        stage ('Gathering ADITools') {
+            steps {
+				echo "Gathering ADITools..."
+                withCredentials([usernameColonPassword(credentialsId: 'BitBucketJenkins', variable: 'USERPASS')]) {
+					sh """
+                     rm -rf aditools
+                     git clone --depth 1 --branch $ADI_TOOLS_VERSION http://$USERPASS@systems.stash.igt.com/scm/adir/aditools.git
+					 cp -r aditools/sonar/* $WORKSPACE 
+                     cp -r aditools/build/* $WORKSPACE 
+                     cp -r aditools/deploy/* $WORKSPACE                     
+                     chmod -R a+x *.sh
+					"""
+				}
+            }
+        }
+		stage ('Zip Source') {
+			steps {
+				echo "Zipping Source..."
+				script {
+					def filename = env.CONTAINER_NAME + "-" + env.VERSION_NUMBER
+					sh "${env.WORKSPACE}/zipSrc.sh \"${filename}\" \"Source\""
+				}
+			}
+		}  
+        stage ('Build') {
+            steps {
+                // parse the output using visual studio parsing rules
+                echo "Building Files..."
+				echo sh(returnStdout: true, script: 'env')
+				script {
+				    //if this is a pull request branch, set the branch name to the Target branch name otherwise use branch name
+				    //when we create a docker image, we have to add a specific name
+					if (env.CHANGE_TARGET) {
+						env.TARGET_BRANCH_NAME = env.CHANGE_TARGET
+					}
+					else {
+						env.TARGET_BRANCH_NAME = env.BRANCH_NAME
+					}
+					//if this is a PR, we want to use GIT_URL_2 as it will be an env variable and GIT_URL will not
+					if (env.GIT_URL) {
+						git_url = env.GIT_URL
+					}
+					else {
+						git_url = env.GIT_URL_2
+					}
+                  
+                    env.GIT_REPO_NAME = git_url.replaceFirst(/^.*\/([^\/]+?).git$/, '$1')
+					def current_date = sh(script: "date -u +”%Y-%m-%dT%H:%M:%S%Z”", returnStdout: true).trim()
+                    sh "${env.WORKSPACE}/jenkinsBuild.sh \"${CONTAINER_NAME}\" \"${DOCKERFILE_LOC}\" \"${current_date}\" \"${env.NODE_NAME}\" \"${git_url}\" \"${env.GIT_COMMIT}\" \"${env.TARGET_BRANCH_NAME}\" \"${env.VERSION_NUMBER}\""
+				}
+            }
+        }  
+        stage ('Testing and Sonar Coverage') {
+            steps {
+				echo "Testing and Sonar Coverage..."
+				withSonarQubeEnv('SonarEnterprise') {
+                    script {
+                    	String pr_key = ""
+						String pr_source_branch = ""
+						String pr_target_branch = ""
+						String source_branch = env.BRANCH_NAME
+						//If Pull Request
+						if (env.CHANGE_TARGET) {
+                            //example: if you're PRing from Dev to Master, your PR is #X then pr_key = PR-X pr_source_branch = Dev pr_target_branch = master
+							pr_key = env.BRANCH_NAME
+							pr_source_branch = env.CHANGE_BRANCH
+							pr_target_branch = env.CHANGE_TARGET
+							source_branch = ""
+						}					
+						sh "${env.WORKSPACE}/sonar.sh \"${env.OP_VERSION_NOBUILD}\" \"${pr_key}\" \"${pr_source_branch}\" \"${pr_target_branch}\" \"${source_branch}\" \"${env.SONAR_SCAN_SOURCE}\" \"${env.SONAR_PROJ_NAME}\" \"${env.SONAR_RUN_DIRECTORY}\" \"${SONAR_ANALYSIS_EXCLUSIONS}\" \"${SONAR_COVERAGE_EXCLUSIONS}\""
+                    }
+                }            
+            }
+        }	
+        stage ('Archive Results') {
+            steps {
+				echo "Archiving Results..."
+                sh "${env.WORKSPACE}/zipTarget.sh \"${env.CONTAINER_NAME}\" \"Deployment\" \"${env.VERSION_NUMBER}\""
+                sh """
+                  mkdir output
+				  cp *.zip output/
+                """
+				dir('output') {
+				    echo "Archiving Output..."
+					archiveArtifacts artifacts: '**', excludes: ''
+				}
+            }
+        }
+    }
+  
+  	post {
+		success {
+			script {
+				echo "Success!"
+                if (isDeployable) {
+					withCredentials([usernamePassword(credentialsId: 'TFSBuildVA-Jenkins', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+						sh "${env.WORKSPACE}/deployDrop.sh \"${env.GIT_REPO_NAME}\" \"${env.OP_VERSION}\" \"${env.OP_BRANCH_NAME}\" \"${env.CONTAINER_NAME}\" \"Deployment\" \"TFSDevDrop\" \"${USERNAME}\" \"${PASSWORD}\""
+					}
+                }
+                else {
+                  echo "Branch is not a deployable branch, so build will not be deployed."
+                }
+			}
+		}			
+		failure {
+			emailext attachLog: true, compressLog: true, mimeType: 'text/html',
+				body: '${JELLY_SCRIPT, template="html"}', 
+				recipientProviders: [culprits()], 
+				subject: '$PROJECT_NAME - Build # $BUILD_NUMBER - $BUILD_STATUS!'
+			script {
+				echo "Failed to complete the build."
+			}
+		}
+		always {
+          xunit([MSTest(deleteOutputFiles: true, failIfNotNew: true, pattern: '**/unit_tests.xml', skipNoTestFiles: false, stopProcessingIfError: true)])
+        }
+	}
+}
